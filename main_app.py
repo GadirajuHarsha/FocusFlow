@@ -1,426 +1,862 @@
 import time
 import tkinter as tk
+from tkinter import ttk, simpledialog, filedialog
+import json
+import os
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from gaze_client import GazeFlowClient
+from PIL import Image, ImageTk
 
 class FocusFlowApp:
-        def __init__(self, root_window):
-                # Create the UI window
-                self.root_window = root_window
-                self.root_window.title("FocusFlow - Attention Tracker")
+    def __init__(self, root_window):
+        self.root_window = root_window
+        self.root_window.title("FocusFlow - Attention Tracker")
 
-                self.actual_screen_width = self.root_window.winfo_screenwidth()
-                self.actual_screen_height = self.root_window.winfo_screenheight()
+        self.actual_screen_width = self.root_window.winfo_screenwidth()
+        self.actual_screen_height = self.root_window.winfo_screenheight()
+        self.screen_aspect_ratio = self.actual_screen_width / self.actual_screen_height
 
-                self.canvas_width = 810
-                self.canvas_height = 540
-                self.root_window.geometry(f"{self.canvas_width}x{self.canvas_height + 110}") 
+        self._setup_styles()
 
-                # Create the buttons and labels
-                self.status_label = tk.Label(root_window, text="Welcome to FocusFlow! Click 'Connect'")
-                self.status_label.pack(pady=5)
+        self.landing_frame = ttk.Frame(root_window, style="App.TFrame")
+        self.main_app_frame = ttk.Frame(root_window, style="App.TFrame")
+        self.session_overlay_window = None
+        self.aoi_definition_window = None
+        self.report_window_instance = None
 
-                self.connect_button = tk.Button(root_window, text="Connect to GazePointer", command=self.toggle_connection)
-                self.connect_button.pack(pady=5)
+        self.logo_photo_image = None
+        self._setup_landing_page()
+        self._setup_main_app_frame_widgets()
 
-                # Create the frame of AOI controls
-                self.aoi_controls_frame = tk.Frame(root_window)
-                self.aoi_controls_frame.pack(pady=5)
+        self.show_landing_page()
 
-                self.add_productive_aoi_button = tk.Button(self.aoi_controls_frame, text="Add Productive AOI", command=lambda: self.start_defining_aoi("Productive"))
-                self.add_productive_aoi_button.pack(side=tk.LEFT, padx=5)
+        self.gz_client = GazeFlowClient()
+        self.is_tracking_connection = False
+        self.after_id_gaze_update = None
+        self.after_id_session_timer = None
 
-                self.add_distraction_aoi_button = tk.Button(self.aoi_controls_frame, text="Add Distraction AOI", command=lambda: self.start_defining_aoi("Distraction"))
-                self.add_distraction_aoi_button.pack(side=tk.LEFT, padx=5)
+        self.aoi_list = []
+        self.temp_aoi_points = []
+        self.defining_aoi_type_transparent = None
+        self.temp_rect_drawing_id = None
 
-                self.clear_aois_button = tk.Button(self.aoi_controls_frame, text="Clear All AOIs", command=self.clear_all_aois)
-                self.clear_aois_button.pack(side=tk.LEFT, padx=5)
+        self.session_active = False
+        self.session_data_log = []
+        self.session_start_time = None
+        self.session_elapsed_time_str = tk.StringVar(value="00:00:00")
 
-                # Frame for session controls
-                self.session_controls_frame = tk.Frame(root_window)
-                self.session_controls_frame.pack(pady=5)
+        self.current_report_data = None
 
-                self.start_session_button = tk.Button(self.session_controls_frame, text="Start Session", command=self.start_tracking_session, state=tk.NORMAL)
-                self.start_session_button.pack(side=tk.LEFT, padx=5)
+        self.root_window.protocol("WM_DELETE_WINDOW", self.on_closing)
+        self.root_window.grid_rowconfigure(0, weight=1)
+        self.root_window.grid_columnconfigure(0, weight=1)
 
-                self.end_session_button = tk.Button(self.session_controls_frame, text="End Session", command=self.end_tracking_session, state=tk.DISABLED)
-                self.end_session_button.pack(side=tk.LEFT, padx=5)
+    def _setup_styles(self):
+        self.style = ttk.Style()
 
-                # Create the canvas to show the gaze tracking dot
-                self.canvas = tk.Canvas(root_window, width=self.canvas_width, height=self.canvas_height, bg="lightgray")
-                self.canvas.pack(pady=10)
-                self.gaze_dot = self.canvas.create_oval(0,0,0,0, fill="red", outline="red")
+        try:
+            self.default_font = ("Segoe UI", 10)
+            self.header_font = ("Segoe UI", 18, "bold")
+            self.status_font = ("Segoe UI", 9)
+            self.overlay_font = ("Segoe UI", 10, "bold")
+            self.aoi_def_font = ("Segoe UI", 12, "bold")
+            self.report_header_font = ("Segoe UI", 14, "bold")
+            self.report_font = ("Segoe UI", 10)
+            self.report_font_bold = ("Segoe UI", 10, "bold")
+            self.report_font_italic = ("Segoe UI", 10, "italic")
+            self.chart_font_family = "Segoe UI"
+            self.chart_font_size_small = 7
+            self.chart_font_size_normal = 8
+            self.chart_font_size_title = 10
+        except tk.TclError:
+            self.default_font = ("Calibri", 10); self.header_font = ("Calibri", 18, "bold")
+            self.status_font = ("Calibri", 9); self.overlay_font = ("Calibri", 10, "bold")
+            self.aoi_def_font = ("Calibri", 12, "bold"); self.report_header_font = ("Calibri", 14, "bold")
+            self.report_font = ("Calibri", 10)
+            self.report_font_bold = ("Calibri", 10, "bold")
+            self.report_font_italic = ("Calibri", 10, "italic")
+            self.chart_font_family = "Calibri"
+            self.chart_font_size_small = 7
+            self.chart_font_size_normal = 8
+            self.chart_font_size_title = 10
 
-                # Set the starting gaze tracking status
-                self.gz_client = GazeFlowClient()
-                self.is_tracking = False
-                self.after_id = None
+        self.style.configure("TButton", font=self.default_font)
+        self.style.configure("TLabel", font=self.default_font)
+        self.style.configure("Header.TLabel", font=self.header_font)
+        self.style.configure("Status.TLabel", font=self.status_font, anchor=tk.W)
+        self.style.configure("ReportHeader.TLabel", font=self.report_header_font)
+        self.style.configure("SessionOverlay.TFrame", background="#2c3e50")
+        self.style.configure("SessionOverlay.TLabel", font=self.overlay_font, foreground="white", background="#2c3e50")
 
-                # Clear the AOI list
-                self.aoi_list = []
-                self.current_aoi_start_coords = None
-                self.defining_aoi_type = None
+    def _setup_landing_page(self):
+        self.landing_frame.grid_columnconfigure(0, weight=1)
+        self.landing_frame.grid_rowconfigure(0, weight=1)
+        self.landing_frame.grid_rowconfigure(3, weight=1)
+        content_frame = ttk.Frame(self.landing_frame)
+        content_frame.grid(row=1, column=0, rowspan=2)
+        try:
+            logo_path = os.path.join(os.path.dirname(__file__), "logo.png")
+            img = Image.open(logo_path)
+            max_width = 200
+            max_height = 100
+            img.thumbnail((max_width, max_height), Image.Resampling.LANCZOS)
 
-                # Reset AOI preview rectangle
-                self.preview_rectangle_id = None
-                self.canvas.bind("<ButtonPress-1>", self.on_aoi_drag_start)
-                self.canvas.bind("<B1-Motion>", self.on_aoi_drag_motion)
-                self.canvas.bind("<ButtonRelease-1>", self.on_aoi_drag_release)
+            self.logo_photo_image = ImageTk.PhotoImage(img)
+            logo_label = ttk.Label(content_frame, image=self.logo_photo_image)
+            logo_label.pack(pady=(20,10))
+        except FileNotFoundError:
+            print("Logo file 'logo.png' not found. Displaying text title instead.")
+            ttk.Label(content_frame, text="FocusFlow", style="Header.TLabel").pack(pady=(20,10))
+        except Exception as e:
+            print(f"Error loading logo: {e}. Displaying text title instead.")
+            ttk.Label(content_frame, text="FocusFlow", style="Header.TLabel").pack(pady=(20,10))
+        ttk.Label(content_frame, text="Visualize and Understand Your Attentional Patterns", wraplength=400, justify=tk.CENTER).pack(pady=10)
+        ttk.Button(content_frame, text="Get Started", command=self.show_main_app_page).pack(pady=20, ipadx=10, ipady=5)
 
-                # Session state variables
-                self.session_active = False
-                # Store logged gaze data during a session
-                self.session_data_log = [] 
-                self.session_start_time = None
+    def _setup_main_app_frame_widgets(self):
+        self.main_app_frame.grid_rowconfigure(3, weight=1)
+        self.main_app_frame.grid_columnconfigure(0, weight=1)
 
-        def toggle_connection(self):
-                if not self.gz_client.is_connected:
-                        # Connect
-                        if self.gz_client.connect():
-                                # Successful connection
-                                self.status_label.config(text="Connected! Receiving gaze data...")
-                                self.connect_button.config(text="Disconnect")
-                                self.is_tracking = True
-                                self.update_gaze_dot()
-                        else:
-                                # Failed connection
-                                self.is_tracking = False
-                                # Cancel any scheduled updates
-                                if self.after_id:
-                                        self.root_window.after_cancel(self.after_id)
-                                        self.after_id = None
-                                self.gz_client.disconnect()
-                                self.status_label.config(text="Connection failed. Is GazePointer running?")
-                                self.connect_button.config(text="Connect to GazePointer")
-                                self.canvas.coords(self.gaze_dot, 0, 0, 0, 0)
-                else:
-                        # Disconnect
-                        self.is_tracking = False
-                        # Cancel any scheduled updates
-                        if self.after_id:
-                                self.root_window.after_cancel(self.after_id)
-                                self.after_id = None
-                        self.gz_client.disconnect()
-                        self.status_label.config(text="Disconnected. Click 'Connect' to start.")
-                        self.connect_button.config(text="Connect to GazePointer")
-                        self.canvas.coords(self.gaze_dot, 0, 0, 0, 0)
+        self.status_label = ttk.Label(self.main_app_frame, text="Connect to GazePointer and define AOIs.", style="Status.TLabel")
+        self.status_label.grid(row=0, column=0, sticky="ew", padx=10, pady=(10,5))
 
-        def update_gaze_dot(self):
-                # Update the dot only if the gaze tracker is currently connected and tracking
-                if not self.is_tracking or not self.gz_client.is_connected:
-                        return
+        conn_frame = ttk.Frame(self.main_app_frame, style="Controls.TFrame", padding=10)
+        conn_frame.grid(row=1, column=0, sticky="ew", padx=10, pady=5); conn_frame.grid_columnconfigure(0, weight=1)
+        self.connect_button = ttk.Button(conn_frame, text="Connect to GazePointer", command=self.toggle_connection)
+        self.connect_button.grid(row=0, column=0, pady=5)
 
-                gaze_data = self.gz_client.receive_gaze_data()
-                # Ensure the data is valid
-                if gaze_data and 'GazeX' in gaze_data and 'GazeY' in gaze_data:
-                        raw_gaze_x = gaze_data['GazeX']
-                        raw_gaze_y = gaze_data['GazeY']
+        aoi_ctrl_frame = ttk.Frame(self.main_app_frame, style="Controls.TFrame", padding=10)
+        aoi_ctrl_frame.grid(row=2, column=0, sticky="ew", padx=10, pady=5)
+        for i in range(3): aoi_ctrl_frame.grid_columnconfigure(i, weight=1)
+        self.add_productive_aoi_button = ttk.Button(aoi_ctrl_frame, text="Add Productive AOI", command=lambda: self.initiate_transparent_aoi_definition("Productive"))
+        self.add_productive_aoi_button.grid(row=0, column=0, padx=5, sticky="ew")
+        self.add_distraction_aoi_button = ttk.Button(aoi_ctrl_frame, text="Add Distraction AOI", command=lambda: self.initiate_transparent_aoi_definition("Distraction"))
+        self.add_distraction_aoi_button.grid(row=0, column=1, padx=5, sticky="ew")
+        self.clear_aois_button = ttk.Button(aoi_ctrl_frame, text="Clear All AOIs", command=self.clear_all_aois)
+        self.clear_aois_button.grid(row=0, column=2, padx=5, sticky="ew")
 
-                        # Scale the coordinates to fit the box
-                        x = 0
-                        y = 0
-                        if self.actual_screen_width > 0 and self.actual_screen_height > 0:
-                                x = (raw_gaze_x / self.actual_screen_width) * self.canvas_width
-                                y = (raw_gaze_y / self.actual_screen_height) * self.canvas_height
-                        else:
-                                x = raw_gaze_x
-                                y = raw_gaze_y
-                        
-                        # Update coordinates of the gaze tracking dot
-                        dot_size = 10
-                        self.canvas.coords(self.gaze_dot, x - dot_size/2, y - dot_size/2, x + dot_size/2, y + dot_size/2)
+        self.canvas_aspect_frame = ttk.Frame(self.main_app_frame, style="App.TFrame")
+        self.canvas_aspect_frame.grid(row=3, column=0, sticky="nsew", padx=10, pady=5)
+        self.canvas_aspect_frame.bind("<Configure>", self.resize_preview_canvas)
 
-                        # Log the gaze data if a session is active
-                        if self.session_active:
-                                current_timestamp = time.time()
-                                aoi_type_hit = "Outside"
+        self.canvas_aoi_preview = tk.Canvas(self.canvas_aspect_frame, bg="lightgray", highlightthickness=0)
+        self.canvas_aoi_preview.place(relx=0.5, rely=0.5, anchor=tk.CENTER)
+        self.gaze_dot_preview = self.canvas_aoi_preview.create_oval(0,0,0,0, fill="#3498db", outline="#2980b9", width=2)
 
-                                candidate_hit_aois = []
-                                for i, aoi_item in enumerate(self.aoi_list):
-                                        r_x1, r_y1, r_x2, r_y2 = aoi_item['rect']
-                                        if r_x1 <= x <= r_x2 and r_y1 <= y <= r_y2:
-                                                area = (r_x2 - r_x1) * (r_y2 - r_y1)
-                                                candidate_hit_aois.append({
-                                                        'type': aoi_item['type'],
-                                                        'index': i,
-                                                        'area': area,
-                                                        'rect_coords': aoi_item['rect'],
-                                                })
+        session_reports_frame = ttk.Frame(self.main_app_frame, style="Controls.TFrame", padding=10)
+        session_reports_frame.grid(row=4, column=0, sticky="ew", padx=10, pady=5)
+        session_reports_frame.grid_columnconfigure(0, weight=1); session_reports_frame.grid_columnconfigure(1, weight=1)
+        self.start_session_button = ttk.Button(session_reports_frame, text="Start Session", command=self.start_tracking_session_ui)
+        self.start_session_button.grid(row=0, column=0, pady=5, padx=(0,5), sticky="ew")
+        self.view_reports_button = ttk.Button(session_reports_frame, text="View Saved Reports", command=self.load_and_show_report)
+        self.view_reports_button.grid(row=0, column=1, pady=5, padx=(5,0), sticky="ew")
 
-                                if candidate_hit_aois:
-                                        # Sort by area and take the largest
-                                        candidate_hit_aois.sort(key=lambda item: (item['area'], item['index']))
-                                        chosen_aoi = candidate_hit_aois[0]
-                                        aoi_type_hit = chosen_aoi['type']
-                                
-                                log_entry = {
-                                        'timestamp': current_timestamp - (self.session_start_time if self.session_start_time else current_timestamp),
-                                        'raw_x': raw_gaze_x,
-                                        'raw_y': raw_gaze_y,
-                                        'canvas_x': x,
-                                        'canvas_y': y,
-                                        'aoi_status': aoi_type_hit,
-                                }
+        self.back_to_home_button = ttk.Button(self.main_app_frame, text="< Back to Home", command=self.show_landing_page)
+        self.back_to_home_button.grid(row=5, column=0, pady=(5,10), padx=10)
 
-                                self.session_data_log.append(log_entry)
-                        
-                        elif self.defining_aoi_type is None:
-                                # Only update gaze coordinates if not defining AOI AND not in session
-                                self.status_label.config(text=f"Gaze: X={x:.0f}, Y={y:.0f}")
+    def resize_preview_canvas(self, event):
+        frame_width = event.width
+        frame_height = event.height
 
-                elif not self.gz_client.is_connected:
-                        # If the gaze tracker is not connected, toggle the connection status
-                        self.toggle_connection()
-                        return
+        canvas_w, canvas_h = frame_width, int(frame_width / self.screen_aspect_ratio)
+        if canvas_h > frame_height:
+            canvas_h = frame_height
+            canvas_w = int(frame_height * self.screen_aspect_ratio)
+            
+        canvas_w = max(20, canvas_w)
+        canvas_h = max(20, canvas_h)
 
-                # Schedule the next update, update at roughly 60 FPS (1000ms/15ms)
-                self.after_id = self.root_window.after(15, self.update_gaze_dot)
+        self.canvas_aoi_preview.config(width=canvas_w, height=canvas_h)
+        self.draw_aois_on_preview_canvas()
 
-        def on_closing(self):
-                if self.session_active:
-                        self.end_tracking_session(force_end=True)
-                if self.gz_client.is_connected:
-                        self.gz_client.disconnect()
-                self.root_window.destroy()
+
+    def show_landing_page(self):
+        self.main_app_frame.grid_remove()
+        if self.session_overlay_window: self.session_overlay_window.destroy(); self.session_overlay_window = None
+        if self.report_window_instance: self.report_window_instance.destroy(); self.report_window_instance = None
+        self.landing_frame.grid(row=0, column=0, sticky="nsew")
+
+
+    def show_main_app_page(self):
+        self.landing_frame.grid_remove()
+        if self.report_window_instance: self.report_window_instance.destroy(); self.report_window_instance = None
+        self.main_app_frame.grid(row=0, column=0, sticky="nsew")
+
+    def _create_session_overlay(self):
+        if self.session_overlay_window: self.session_overlay_window.destroy()
+        self.session_overlay_window = tk.Toplevel(self.root_window)
+        self.session_overlay_window.attributes('-topmost', True)
+        self.session_overlay_window.overrideredirect(True)
+
+        overlay_frame = ttk.Frame(self.session_overlay_window, style="SessionOverlay.TFrame", padding=10)
+        overlay_frame.pack(expand=True, fill='both')
+
+        ttk.Label(overlay_frame, text="Session Active", style="SessionOverlay.TLabel").pack(pady=(0,5))
+        self.overlay_timer_label = ttk.Label(overlay_frame, textvariable=self.session_elapsed_time_str, style="SessionOverlay.TLabel")
+        self.overlay_timer_label.pack(pady=5)
+        self.overlay_focus_indicator_canvas = tk.Canvas(overlay_frame, width=25, height=25, bg="gray", highlightthickness=0)
+        self.overlay_focus_indicator_canvas.pack(pady=(5,10))
+        end_button = ttk.Button(overlay_frame, text="End Session", command=self.end_tracking_session_ui)
+        end_button.pack(pady=(5,0), fill=tk.X, expand=True)
+
+        overlay_width, overlay_height = 200, 180
+        x_pos = self.root_window.winfo_screenwidth() - overlay_width - 20
+        y_pos = 20
+        self.session_overlay_window.geometry(f"{overlay_width}x{overlay_height}+{x_pos}+{y_pos}")
+        self.session_overlay_window.resizable(False, False)
+
+
+    def _update_session_timer_display(self):
+        if self.session_active and self.session_start_time:
+            elapsed = time.time() - self.session_start_time
+            self.session_elapsed_time_str.set(time.strftime("%H:%M:%S", time.gmtime(elapsed)))
+            self.after_id_session_timer = self.root_window.after(1000, self._update_session_timer_display)
+
+
+    def toggle_connection(self):
+        if not self.gz_client.is_connected:
+            if self.gz_client.connect():
+                self.status_label.config(text="Connected! Receiving gaze data...")
+                self.connect_button.config(text="Disconnect from GazePointer")
+                self.is_tracking_connection = True
+                self.update_gaze_preview_loop()
+            else:
+                self.status_label.config(text="Connection failed. Is GazePointer running?")
+                self.gz_client.disconnect(); self.is_tracking_connection = False
+        else:
+            self.is_tracking_connection = False
+            if self.after_id_gaze_update: self.root_window.after_cancel(self.after_id_gaze_update)
+            self.gz_client.disconnect()
+            self.status_label.config(text="Disconnected. Connect to start.")
+            self.connect_button.config(text="Connect to GazePointer")
+            if hasattr(self, 'canvas_aoi_preview'): self.canvas_aoi_preview.coords(self.gaze_dot_preview,0,0,0,0)
+
+
+    def update_gaze_preview_loop(self):
+        if not self.is_tracking_connection or not self.gz_client.is_connected:
+            self._update_focus_indicator_colors("gray")
+            return
+
+        gaze_data = self.gz_client.receive_gaze_data()
+        current_aoi_hit_type_for_session = "Outside"
+
+        if gaze_data and 'GazeX' in gaze_data and 'GazeY' in gaze_data:
+            raw_x, raw_y = gaze_data['GazeX'], gaze_data['GazeY']
+            
+            if hasattr(self, 'canvas_aoi_preview') and self.canvas_aoi_preview.winfo_exists():
+                canvas_w, canvas_h = self.canvas_aoi_preview.winfo_width(), self.canvas_aoi_preview.winfo_height()
+                if canvas_w > 1 and canvas_h > 1 :
+                    preview_x = (raw_x / self.actual_screen_width) * canvas_w
+                    preview_y = (raw_y / self.actual_screen_height) * canvas_h
+                    dot_size = 10
+                    self.canvas_aoi_preview.coords(self.gaze_dot_preview, preview_x - dot_size/2, preview_y - dot_size/2, preview_x + dot_size/2, preview_y + dot_size/2)
+
+                    current_aoi_hit_type_for_preview = "Outside"
+                    if self.aoi_list:
+                        scaled_hits = []
+                        for aoi in self.aoi_list:
+                            r_x1_c = (aoi['rect_screen_coords'][0] / self.actual_screen_width) * canvas_w
+                            r_y1_c = (aoi['rect_screen_coords'][1] / self.actual_screen_height) * canvas_h
+                            r_x2_c = (aoi['rect_screen_coords'][2] / self.actual_screen_width) * canvas_w
+                            r_y2_c = (aoi['rect_screen_coords'][3] / self.actual_screen_height) * canvas_h
+                            if r_x1_c <= preview_x <= r_x2_c and r_y1_c <= preview_y <= r_y2_c:
+                                area = (r_x2_c - r_x1_c) * (r_y2_c - r_y1_c)
+                                scaled_hits.append({'type': aoi['type'], 'area': area})
+                        if scaled_hits:
+                            scaled_hits.sort(key=lambda item: item['area'])
+                            current_aoi_hit_type_for_preview = scaled_hits[0]['type']
+                    self._update_gaze_dot_preview_color(current_aoi_hit_type_for_preview)
+                    if not self.session_active and self.defining_aoi_type_transparent is None:
+                         self.status_label.config(text=f"Gaze (Preview): X={preview_x:.0f}, Y={preview_y:.0f} | AOI: {current_aoi_hit_type_for_preview}")
+
+
+            if self.session_active:
+                session_hits = []
+                for aoi in self.aoi_list:
+                    sx1, sy1, sx2, sy2 = aoi['rect_screen_coords']
+                    if sx1 <= raw_x <= sx2 and sy1 <= raw_y <= sy2:
+                        area = (sx2-sx1) * (sy2-sy1)
+                        session_hits.append({'type': aoi['type'], 'area': area})
+                if session_hits:
+                    session_hits.sort(key=lambda item: item['area'])
+                    current_aoi_hit_type_for_session = session_hits[0]['type']
+                self._update_focus_indicator_colors(current_aoi_hit_type_for_session)
+                self.session_data_log.append({
+                    'timestamp': time.time() - self.session_start_time,
+                    'raw_x': raw_x, 'raw_y': raw_y, 'aoi_status': current_aoi_hit_type_for_session
+                })
+
+        elif not self.gz_client.is_connected:
+            self.status_label.config(text="Connection lost. Please check GazePointer.")
+            self.connect_button.config(text="Connect to GazePointer"); self.is_tracking_connection = False
+            self._update_focus_indicator_colors("gray"); self.gz_client.disconnect()
+            return
+        self.after_id_gaze_update = self.root_window.after(30, self.update_gaze_preview_loop)
+
+    def _update_gaze_dot_preview_color(self, aoi_type):
+        if not hasattr(self, 'canvas_aoi_preview') or not self.canvas_aoi_preview.winfo_exists(): return
+        color_map = {"Productive": "green", "Distraction": "orange", "Outside": "red", "gray":"#7f8c8d"}
+        fill_color = color_map.get(aoi_type, "red")
+        outline_color = {"green": "#27ae60", "orange": "#f39c12", "red": "#c0392b", "gray":"#7f8c8d"}.get(aoi_type, "#c0392b")
+        self.canvas_aoi_preview.itemconfig(self.gaze_dot_preview, fill=fill_color, outline=outline_color)
+
+
+    def _update_focus_indicator_colors(self, aoi_type_for_session):
+        if not self.session_active or not self.session_overlay_window: return
+        try:
+            color_map = {"Productive": "green", "Distraction": "orange", "Outside": "red", "gray":"gray"}
+            indicator_color = color_map.get(aoi_type_for_session, "gray")
+            if self.overlay_focus_indicator_canvas and self.overlay_focus_indicator_canvas.winfo_exists():
+                 self.overlay_focus_indicator_canvas.config(bg=indicator_color)
+        except tk.TclError: pass
+
+
+    def initiate_transparent_aoi_definition(self, aoi_type):
+        if self.session_active:
+            self.status_label.config(text="Cannot define AOIs during an active session."); return
+        if self.aoi_definition_window: return
+
+        self.defining_aoi_type_transparent = aoi_type
+        self.temp_aoi_points = []
+        self.root_window.attributes('-alpha', 0.05)
+
+        self.aoi_definition_window = tk.Toplevel(self.root_window)
+        self.aoi_definition_window.attributes('-fullscreen', True)
+        self.aoi_definition_window.attributes('-alpha', 0.25)
+        self.aoi_definition_window.attributes('-topmost', True)
+        self.aoi_definition_window.overrideredirect(True)
+
+        aoi_canvas = tk.Canvas(self.aoi_definition_window, bg='gray', highlightthickness=0)
+        aoi_canvas.pack(fill=tk.BOTH, expand=True)
+
+        for existing_aoi in self.aoi_list:
+            xs1, ys1, xs2, ys2 = existing_aoi['rect_screen_coords']
+            color = "green" if existing_aoi['type'] == "Productive" else "orange"
+            aoi_canvas.create_rectangle(xs1, ys1, xs2, ys2, outline=color, width=3)
+
+        instruction_text = f"Defining {aoi_type} AOI: Click for TOP-LEFT corner."
+        self.aoi_instruction_label = ttk.Label(aoi_canvas, text=instruction_text, font=self.aoi_def_font,
+                                              background='white', foreground='black', padding=10, relief="raised")
+        aoi_canvas.create_window(self.actual_screen_width / 2, 50, window=self.aoi_instruction_label, anchor=tk.CENTER)
+
+        self.temp_rect_drawing_id = None
+        aoi_canvas.bind("<ButtonPress-1>", self.on_transparent_aoi_click)
+        aoi_canvas.bind("<Motion>", self.on_transparent_aoi_motion_preview)
+        self.aoi_definition_window.focus_force()
+
+
+    def on_transparent_aoi_motion_preview(self, event):
+        if not self.aoi_definition_window or not self.defining_aoi_type_transparent or len(self.temp_aoi_points) != 1:
+            return
         
-        def start_defining_aoi(self, aoi_type):
-                if self.session_active:
-                        self.status_label.config(text="Cannot define AOIs during an active session.")
-                        return
-                self.status_label.config(text=f"Defining {aoi_type} AOI: Click 1st corner...")
-                self.defining_aoi_type = aoi_type
+        aoi_canvas = event.widget
+        x1_screen, y1_screen = self.temp_aoi_points[0]
+        x2_curr_screen, y2_curr_screen = event.x_root, event.y_root
 
-        def on_aoi_drag_start(self, event):
-                # Continue only if in AOI definition mode and not in session
-                if self.defining_aoi_type is None or self.session_active: 
-                        return
-                
-                # Store the starting point for the drag
-                self.current_aoi_start_coords = (event.x, event.y)
+        if self.temp_rect_drawing_id:
+            aoi_canvas.coords(self.temp_rect_drawing_id, x1_screen, y1_screen, x2_curr_screen, y2_curr_screen)
+        else:
+            self.temp_rect_drawing_id = aoi_canvas.create_rectangle(
+                x1_screen, y1_screen, x2_curr_screen, y2_curr_screen,
+                outline="yellow", width=2, dash=(4, 2)
+            )
 
-                # Delete any in-progress preview rectangles
-                if self.preview_rectangle_id:
-                        self.canvas.delete(self.preview_rectangle_id)
 
-                # Make the preview rectangle dashed
-                color = "green" if self.defining_aoi_type == "Productive" else "orange"
-                self.preview_rectangle_id = self.canvas.create_rectangle(
-                        event.x, event.y, event.x, event.y, 
-                        outline=color, dash=(4, 2)
-                )
-                self.status_label.config(text=f"Defining {self.defining_aoi_type} AOI: Drag to set size, release to confirm.")
+    def on_transparent_aoi_click(self, event):
+        if not self.aoi_definition_window or not self.defining_aoi_type_transparent: return
+        self.temp_aoi_points.append((event.x_root, event.y_root))
+        aoi_canvas = event.widget
 
-        def on_aoi_drag_motion(self, event):
-                # Continue only if in AOI definition mode and drawing has started
-                if self.defining_aoi_type is None or self.current_aoi_start_coords is None or self.session_active:
-                        return
+        if len(self.temp_aoi_points) == 1:
+            self.aoi_instruction_label.config(text=f"Defining {self.defining_aoi_type_transparent} AOI: Move mouse to set size, then click for BOTTOM-RIGHT corner.")
+            if self.temp_rect_drawing_id: aoi_canvas.delete(self.temp_rect_drawing_id)
+            x1_screen, y1_screen = self.temp_aoi_points[0]
+            self.temp_rect_drawing_id = aoi_canvas.create_rectangle(x1_screen, y1_screen, x1_screen +1, y1_screen+1, outline="yellow", width=2, dash=(4,2))
 
-                # Update the coordinates of the preview rectangle
-                x1, y1 = self.current_aoi_start_coords
-                x2, y2 = event.x, event.y
-                if self.preview_rectangle_id:
-                        self.canvas.coords(self.preview_rectangle_id, x1, y1, x2, y2)
+        elif len(self.temp_aoi_points) == 2:
+            if self.temp_rect_drawing_id: aoi_canvas.delete(self.temp_rect_drawing_id); self.temp_rect_drawing_id = None
+            x1_s, y1_s = self.temp_aoi_points[0]; x2_s, y2_s = self.temp_aoi_points[1]
+            fx1, fy1 = min(x1_s, x2_s), min(y1_s, y2_s)
+            fx2, fy2 = max(x1_s, x2_s), max(y1_s, y2_s)
+
+            if fx1==fx2 or fy1==fy2: self.status_label.config(text="AOI def cancelled (too small).")
+            else:
+                self.aoi_list.append({'rect_screen_coords': (fx1,fy1,fx2,fy2), 'type': self.defining_aoi_type_transparent})
+                self.status_label.config(text=f"{self.defining_aoi_type_transparent} AOI defined.")
+                self.draw_aois_on_preview_canvas()
+
+            self.aoi_definition_window.destroy(); self.aoi_definition_window = None
+            self.defining_aoi_type_transparent = None; self.temp_aoi_points = []
+            self.root_window.attributes('-alpha', 1.0); self.root_window.deiconify(); self.root_window.focus_force()
+
+    def draw_aois_on_preview_canvas(self):
+        if not hasattr(self, 'canvas_aoi_preview') or not self.canvas_aoi_preview.winfo_exists(): return
+        self.canvas_aoi_preview.delete("aoi_preview_rect", "aoi_preview_label")
+        canvas_w, canvas_h = self.canvas_aoi_preview.winfo_width(), self.canvas_aoi_preview.winfo_height()
+        if canvas_w <= 1 or canvas_h <= 1: return
+
+        for i, aoi in enumerate(self.aoi_list):
+            xs1,ys1,xs2,ys2 = aoi['rect_screen_coords']
+            xc1 = (xs1/self.actual_screen_width)*canvas_w; yc1 = (ys1/self.actual_screen_height)*canvas_h
+            xc2 = (xs2/self.actual_screen_width)*canvas_w; yc2 = (ys2/self.actual_screen_height)*canvas_h
+            color = "green" if aoi['type'] == "Productive" else "orange"
+            self.canvas_aoi_preview.create_rectangle(xc1,yc1,xc2,yc2,outline=color,width=2,tags="aoi_preview_rect")
+            self.canvas_aoi_preview.create_text(xc1+7,yc1+7,text=f"{aoi['type'][0]}{i+1}",anchor=tk.NW,fill=color,font=(self.default_font[0],8,"bold"),tags="aoi_preview_label")
+
+    def clear_all_aois(self):
+        if self.session_active: self.status_label.config(text="Cannot clear AOIs during session."); return
+        self.aoi_list = []; self.draw_aois_on_preview_canvas()
+        self.status_label.config(text="All AOIs cleared.")
+
+
+    def start_tracking_session_ui(self):
+        if not self.gz_client.is_connected: self.status_label.config(text="Not connected."); return
+        if not self.aoi_list: self.status_label.config(text="No AOIs defined."); return
+        if self.session_active: self.status_label.config(text="Session active."); return
+
+        self.session_active = True; self.session_data_log = []
+        self.session_start_time = time.time(); self.session_elapsed_time_str.set("00:00:00")
+        self.current_report_data = None
+
+        self.root_window.withdraw(); self._create_session_overlay(); self._update_session_timer_display()
+        for btn in [self.start_session_button, self.add_productive_aoi_button, self.add_distraction_aoi_button,
+                    self.clear_aois_button, self.connect_button, self.back_to_home_button, self.view_reports_button]:
+            btn.config(state=tk.DISABLED)
+
+    def end_tracking_session_ui(self, force_end=False):
+        if not self.session_active and not force_end: return
+        self.session_active = False
+        if self.after_id_session_timer: self.root_window.after_cancel(self.after_id_session_timer)
+        if self.session_overlay_window: self.session_overlay_window.destroy(); self.session_overlay_window = None
+
+        self.root_window.deiconify(); self.show_main_app_page()
+        for btn in [self.start_session_button, self.add_productive_aoi_button, self.add_distraction_aoi_button,
+                    self.clear_aois_button, self.connect_button, self.back_to_home_button, self.view_reports_button]:
+            btn.config(state=tk.NORMAL)
+
+        if self.session_data_log:
+            self.status_label.config(text="Session ended. Generating report...")
+            self.current_report_data = self.generate_session_metrics_data()
+            self._show_report_window(self.current_report_data, report_title="Current Session Report")
+        else:
+            self.status_label.config(text="Session ended. No data logged.")
+            self.current_report_data = None
+
+    def generate_session_metrics_data(self):
+        if not self.session_data_log: return None
+        report_data = {"raw_log": self.session_data_log, "report_generated_timestamp": time.time()}
+        durations = []
+        if len(self.session_data_log) > 1:
+            for i in range(len(self.session_data_log) - 1):
+                durations.append(self.session_data_log[i+1]['timestamp'] - self.session_data_log[i]['timestamp'])
+            if durations: durations.append(durations[-1])
+            else: durations.append(0.03)
+        elif self.session_data_log: durations.append(0.03)
+
+        time_prod,time_dist,time_out = 0,0,0
+        total_time = sum(durations) if durations else 0
+        report_data["session_duration"] = total_time
+
+        for i, entry in enumerate(self.session_data_log):
+            dt = durations[i]
+            if entry['aoi_status'] == "Productive": time_prod += dt
+            elif entry['aoi_status'] == "Distraction": time_dist += dt
+            else: time_out += dt
         
-        def on_aoi_drag_release(self, event):
-                # Continue only if in AOI definition mode and drawing has started
-                if self.defining_aoi_type is None or self.current_aoi_start_coords is None or self.session_active:
-                        return
+        report_data["dwell_times"] = {"Productive": time_prod, "Distraction": time_dist, "Outside": time_out}
+        report_data["dwell_percentages"] = {
+            "Productive": (time_prod/total_time)*100 if total_time > 0 else 0,
+            "Distraction": (time_dist/total_time)*100 if total_time > 0 else 0,
+            "Outside": (time_out/total_time)*100 if total_time > 0 else 0
+        }
+        p_to_d, d_to_p = 0,0
+        if len(self.session_data_log) > 1:
+            for i in range(1, len(self.session_data_log)):
+                prev, curr = self.session_data_log[i-1]['aoi_status'], self.session_data_log[i]['aoi_status']
+                if prev=="Productive" and curr=="Distraction": p_to_d+=1
+                elif prev=="Distraction" and curr=="Productive": d_to_p+=1
+        report_data["transitions"] = {"P_to_D":p_to_d, "D_to_P":d_to_p}
 
-                # Delete the preview rectangle
-                if self.preview_rectangle_id:
-                        self.canvas.delete(self.preview_rectangle_id)
-                        self.preview_rectangle_id = None
-
-                x1, y1 = self.current_aoi_start_coords
-                x2, y2 = event.x, event.y
-
-                final_x1 = min(x1, x2)
-                final_y1 = min(y1, y2)
-                final_x2 = max(x1, x2)
-                final_y2 = max(y1, y2)
-
-                # Avoid creating zero-size AOIs (click without drag)
-                if final_x1 == final_x2 or final_y1 == final_y2:
-                        self.status_label.config(text=f"AOI definition cancelled (too small). Click and drag to define.")
-                        self.current_aoi_start_coords = None
-                        self.defining_aoi_type = None
-                        return
-
-                aoi_rect = (final_x1, final_y1, final_x2, final_y2)
-                self.aoi_list.append({'rect': aoi_rect, 'type': self.defining_aoi_type})
-
-                # Redraw all AOIs
-                self.draw_aois()
-
-                # Reset for the next AOI definition
-                self.status_label.config(text=f"{self.defining_aoi_type} AOI defined. Add another or start session.")
-                self.current_aoi_start_coords = None
-                self.defining_aoi_type = None
+        bout_durs = []
+        cb_start = None
+        for e in self.session_data_log:
+            is_p = e['aoi_status'] == "Productive"; ts = e['timestamp']
+            if is_p and cb_start is None: cb_start=ts
+            elif not is_p and cb_start is not None:
+                dur = ts - cb_start
+                if dur > 0: bout_durs.append(dur)
+                cb_start = None
+        if cb_start is not None and self.session_data_log:
+            dur = self.session_data_log[-1]['timestamp']-cb_start
+            if dur > 0: bout_durs.append(dur)
         
-        def draw_aois(self):
-                # Delete old AOI drawings by tag
-                self.canvas.delete("aoi_rect") 
-                self.canvas.delete("aoi_label")
+        report_data["focus_bouts"] = {
+            "count": len(bout_durs),
+            "avg_duration": sum(bout_durs)/len(bout_durs) if bout_durs else 0,
+            "max_duration": max(bout_durs) if bout_durs else 0,
+            "durations_list": bout_durs
+        }
+        return report_data
 
-                # Draw all AOIs in the list
-                for i, aoi in enumerate(self.aoi_list):
-                        x1, y1, x2, y2 = aoi['rect']
-                        color = "green" if aoi['type'] == "Productive" else "orange"
-                        
-                        self.canvas.create_rectangle(x1, y1, x2, y2, outline=color, width=2, tags="aoi_rect")
-                        self.canvas.create_text(x1 + 5, y1 + 5, text=f"{aoi['type']} {i+1}", anchor=tk.NW, fill=color, tags="aoi_label")
+    def _show_report_window(self, report_data_current, report_data_comparison=None, report_title="Session Report"):
+        if self.report_window_instance and self.report_window_instance.winfo_exists():
+            self.report_window_instance.destroy()
 
-        def clear_all_aois(self):
-                if self.session_active:
-                        self.status_label.config(text="Cannot clear AOIs during an active session.")
-                        return
-                self.aoi_list = []
-                # Redraw all AOIs (which is none)
-                self.draw_aois() 
-                self.status_label.config(text="All AOIs cleared.")
-                self.defining_aoi_type = None
+        self.report_window_instance = tk.Toplevel(self.root_window)
+        self.report_window_instance.title(report_title)
+        
+        try:
+            self.report_window_instance.state('zoomed')
+        except tk.TclError:
+            screen_width = self.report_window_instance.winfo_screenwidth()
+            screen_height = self.report_window_instance.winfo_screenheight()
+            self.report_window_instance.geometry(f"{screen_width}x{screen_height}+0+0")
 
-        def start_tracking_session(self):
-                if not self.gz_client.is_connected:
-                        self.status_label.config(text="Not connected to GazePointer. Please connect first.")
-                        return
-                
-                if not self.aoi_list:
-                        self.status_label.config(text="No AOIs defined. Please define at least 1 AOI.")
-                        return
-                
-                if self.session_active:
-                        self.status_label.config(text="Session already active. End the session first.")
-                        return
-                
-                # Reset session state
-                self.session_active = True
-                self.session_data_log = []
-                self.session_start_time = time.time()
+        from matplotlib import rcParams
+        
+        is_dark_theme = False
+        try:
+            current_theme_mode = self.root_window.tk.call("ttk::style", "theme", "use")
+            if "dark" in current_theme_mode.lower():
+                is_dark_theme = True
+        except tk.TclError:
+            try:
+                bg_test = self.style.lookup("TFrame", "background")
+                if bg_test and isinstance(bg_test, str) and bg_test.startswith("#"):
+                    hex_color = bg_test.lstrip('#')
+                    rgb = tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
+                    if sum(rgb) < 300:
+                        is_dark_theme = True
+            except tk.TclError:
+                pass
 
-                self.start_session_button.config(state=tk.DISABLED)
-                self.end_session_button.config(state=tk.NORMAL)
-                self.status_label.config(text="Session started. Tracking gaze data.")
-                self.add_productive_aoi_button.config(state=tk.DISABLED)
-                self.add_distraction_aoi_button.config(state=tk.DISABLED)
-                self.clear_aois_button.config(state=tk.DISABLED)
-                self.defining_aoi_type = None
+        default_light_bg = "#f0f0f0"
+        default_dark_bg = "#333333" # Example dark background
+        default_light_text = "black"
+        default_dark_text = "white"
 
-        def end_tracking_session(self, force_end=False):
-                if not self.session_active and not force_end:
-                        self.status_label.config(text="No active session to end.")
-                        return
-                
-                # End the session
-                self.session_active = False
-                self.start_session_button.config(state=tk.NORMAL)
-                self.end_session_button.config(state=tk.DISABLED)
-                self.status_label.config(text="Session ended. Processing data.")
-                self.add_productive_aoi_button.config(state=tk.NORMAL)
-                self.add_distraction_aoi_button.config(state=tk.NORMAL)
-                self.clear_aois_button.config(state=tk.NORMAL)
+        try:
+            chart_bg_color = self.style.lookup("TFrame", "background")
+            if not chart_bg_color or not isinstance(chart_bg_color, str) or not chart_bg_color.startswith("#"):
+                chart_bg_color = default_dark_bg if is_dark_theme else default_light_bg
+        except tk.TclError:
+            chart_bg_color = default_dark_bg if is_dark_theme else default_light_bg
 
-                if self.session_data_log:
-                        # Process the logged data
-                        self.status_label.config(text="Session ended. Calculating metrics...")
-                        self.calculate_session_metrics()
+        try:
+            text_color = self.style.lookup("TLabel", "foreground")
+            if not text_color or not isinstance(text_color, str):
+                 text_color = default_dark_text if is_dark_theme else default_light_text
+        except tk.TclError:
+            text_color = default_dark_text if is_dark_theme else default_light_text
+
+
+        grid_color = '#555555' if is_dark_theme else '#cccccc'
+        pie_edge_color = chart_bg_color
+
+        rcParams['font.family'] = self.chart_font_family
+        rcParams['font.size'] = self.chart_font_size_normal
+        rcParams['axes.titlesize'] = self.chart_font_size_title
+        rcParams['axes.titleweight'] = 'bold'
+        rcParams['axes.labelsize'] = self.chart_font_size_normal
+        rcParams['xtick.labelsize'] = self.chart_font_size_small
+        rcParams['ytick.labelsize'] = self.chart_font_size_small
+        rcParams['legend.fontsize'] = self.chart_font_size_small
+        rcParams['figure.facecolor'] = chart_bg_color
+        rcParams['axes.facecolor'] = chart_bg_color
+        rcParams['savefig.facecolor'] = chart_bg_color
+        rcParams['text.color'] = text_color
+        rcParams['axes.labelcolor'] = text_color
+        rcParams['xtick.color'] = text_color
+        rcParams['ytick.color'] = text_color
+        rcParams['axes.edgecolor'] = text_color
+        rcParams['grid.color'] = grid_color
+
+        outer_frame = ttk.Frame(self.report_window_instance)
+        outer_frame.pack(expand=True, fill='both')
+
+        report_canvas = tk.Canvas(outer_frame, highlightthickness=0, bg=chart_bg_color)
+        report_scrollbar_y = ttk.Scrollbar(outer_frame, orient="vertical", command=report_canvas.yview)
+        report_scrollbar_x = ttk.Scrollbar(outer_frame, orient="horizontal", command=report_canvas.xview)
+        report_canvas.configure(yscrollcommand=report_scrollbar_y.set, xscrollcommand=report_scrollbar_x.set)
+        report_scrollbar_y.pack(side=tk.RIGHT, fill="y"); report_scrollbar_x.pack(side=tk.BOTTOM, fill="x")
+        report_canvas.pack(side=tk.LEFT, fill="both", expand=True)
+
+        main_report_frame = ttk.Frame(report_canvas, padding=20)
+        report_canvas.create_window((0, 0), window=main_report_frame, anchor="nw", tags="main_report_frame")
+        main_report_frame.bind("<Configure>", lambda e: report_canvas.configure(scrollregion=report_canvas.bbox("all")))
+
+        main_report_frame.grid_columnconfigure(0, weight=1, minsize=500)
+        if report_data_comparison:
+             main_report_frame.grid_columnconfigure(1, weight=1, minsize=500)
+
+
+        def create_report_section(parent_frame, data, title_suffix=""):
+            section_style = "Card.TFrame" if "Card.TFrame" in self.style.theme_names() else "TFrame"
+            section_frame = ttk.Frame(parent_frame, style=section_style, padding=(15,10), relief="solid", borderwidth=1)
+
+            if report_data_comparison:
+                col = 0 if "Current" in title_suffix or "Left" in title_suffix else 1
+                section_frame.grid(row=0, column=col, sticky="nsew", padx=10, pady=10)
+                parent_frame.grid_rowconfigure(0, weight=1)
+            else:
+                section_frame.pack(fill='both', expand=True, padx=10, pady=10)
+
+            ttk.Label(section_frame, text=f"Summary Metrics{title_suffix}", style="ReportHeader.TLabel").pack(pady=(0, 10), fill='x', anchor='w')
+            
+            try:
+                text_widget_bg_lookup = self.style.lookup(section_style, 'background')
+                if text_widget_bg_lookup and isinstance(text_widget_bg_lookup, str) and text_widget_bg_lookup.startswith("#"):
+                    text_bg = text_widget_bg_lookup
                 else:
-                        self.status_label.config(text="Session ended. No data logged.")
+                    text_bg = str(chart_bg_color)
+            except tk.TclError:
+                text_bg = str(chart_bg_color)
+            
+            metrics_text_widget = tk.Text(section_frame, wrap=tk.WORD, height=18,
+                                          font=self.report_font, relief="flat",
+                                          borderwidth=0, highlightthickness=0,
+                                          bg=text_bg, fg=str(text_color))
+            metrics_text_widget.pack(pady=5, padx=5, fill='x')
+            self.format_metrics_for_display(data, metrics_text_widget)
+            metrics_text_widget.config(state=tk.DISABLED)
 
-        def calculate_session_metrics(self):
-                if not self.session_data_log:
-                        self.status_label.config(text="Metrics: No data logged.")
-                        return
+            ttk.Label(section_frame, text=f"Visualizations{title_suffix}", style="ReportHeader.TLabel").pack(pady=(20,10), fill='x', anchor='w')
+            viz_container_frame = ttk.Frame(section_frame)
+            viz_container_frame.pack(fill='both', expand=True, pady=(0,10))
 
-                durations = []
-                if len(self.session_data_log) > 1:
-                        for i in range(len(self.session_data_log) - 1):
-                                durations.append(self.session_data_log[i+1]['timestamp'] - self.session_data_log[i]['timestamp'])
-                        if durations:
-                                durations.append(durations[-1]) 
-                        else: 
-                                durations.append(0.015) 
-                elif self.session_data_log: 
-                        durations.append(0.015)
+            pie_frame = ttk.Frame(viz_container_frame)
+            pie_frame.pack(side=tk.LEFT, fill='both', expand=True, padx=5, pady=5)
+            try:
+                fig_pie = Figure(figsize=(4.8, 3.8), dpi=90, facecolor=chart_bg_color)
+                ax_pie = fig_pie.add_subplot(111)
+                ax_pie.set_facecolor(chart_bg_color)
 
-                time_in_productive = 0
-                time_in_distraction = 0
-                time_in_outside = 0
-                # More accurate total time
-                total_logged_time = sum(durations)
+                labels = ['Productive', 'Distraction', 'Outside AOIs']
+                sizes = [data['dwell_times'].get('Productive',0), data['dwell_times'].get('Distraction',0), data['dwell_times'].get('Outside',0)]
+                pie_colors = ['#5cb85c', '#f0ad4e', '#d9534f'] if sum(sizes) > 0 else ['#777777']*3
+                valid_sizes = any(s > 0 for s in sizes)
+                explode = (0.05 if data['dwell_times'].get('Productive',0) > 0 and valid_sizes else 0, 0, 0)
 
-                for i, entry in enumerate(self.session_data_log):
-                        delta_time = durations[i]
-                        if entry['aoi_status'] == "Productive":
-                                time_in_productive += delta_time
-                        elif entry['aoi_status'] == "Distraction":
-                                time_in_distraction += delta_time
-                        else:
-                                time_in_outside += delta_time
-                
-                print("\n--- Session Metrics ---")
-                metrics_summary = f"Total Session Time: {total_logged_time:.2f} seconds\n"
-                if total_logged_time > 0:
-                        metrics_summary += f"Time in Productive: {time_in_productive:.2f}s ({(time_in_productive/total_logged_time)*100:.1f}%)\n"
-                        metrics_summary += f"Time in Distraction: {time_in_distraction:.2f}s ({(time_in_distraction/total_logged_time)*100:.1f}%)\n"
-                        metrics_summary += f"Time Outside AOIs: {time_in_outside:.2f}s ({(time_in_outside/total_logged_time)*100:.1f}%)"
+                if valid_sizes:
+                    wedges, texts_pie, autotexts = ax_pie.pie(sizes, explode=explode, labels=None, colors=pie_colors,
+                                                          autopct=lambda p: '{:.1f}%\n({:.1f}s)'.format(p, p * sum(sizes) / 100.0) if p > 1 else '',
+                                                          shadow=False, startangle=120, pctdistance=0.8,
+                                                          textprops={'color': "white" if is_dark_theme else "black", 'fontsize':self.chart_font_size_small, 'weight':'bold'},
+                                                          wedgeprops={'edgecolor': pie_edge_color, 'linewidth': 0.5})
+                    ax_pie.legend(wedges, labels, title="AOI Types", loc="center left",
+                                  bbox_to_anchor=(0.98, 0, 0.5, 1), fontsize=self.chart_font_size_small,
+                                  labelcolor=text_color, title_fontproperties={'size':self.chart_font_size_small, 'weight':'bold'})
                 else:
-                        metrics_summary += "Not enough data for dwell time calculation."
-                print(metrics_summary)
+                    ax_pie.text(0.5, 0.5, "No dwell data", ha='center', va='center', color=text_color)
+                ax_pie.set_title('Dwell Time Distribution', color=text_color)
+                fig_pie.tight_layout(pad=0.5)
+                canvas_pie = FigureCanvasTkAgg(fig_pie, master=pie_frame)
+                canvas_pie.draw(); canvas_pie.get_tk_widget().pack(fill='both', expand=True)
+            except Exception as e:
+                print(f"Error creating pie chart: {e}")
+                ttk.Label(pie_frame, text=f"Err: Pie Chart ({e})", wraplength=180).pack()
 
-                productive_to_distraction = 0
-                distraction_to_productive = 0
-                
-                if len(self.session_data_log) > 1:
-                        for i in range(1, len(self.session_data_log)):
-                                prev_status = self.session_data_log[i-1]['aoi_status']
-                                curr_status = self.session_data_log[i]['aoi_status']
+            timeline_frame = ttk.Frame(viz_container_frame)
+            timeline_frame.pack(side=tk.LEFT, fill='both', expand=True, padx=5, pady=5)
+            try:
+                fig_timeline = Figure(figsize=(5.2, 3.8), dpi=90, facecolor=chart_bg_color)
+                ax_timeline = fig_timeline.add_subplot(111)
+                ax_timeline.set_facecolor(chart_bg_color)
 
-                                if prev_status == "Productive" and curr_status == "Distraction":
-                                        productive_to_distraction += 1
-                                elif prev_status == "Distraction" and curr_status == "Productive":
-                                        distraction_to_productive += 1
-                
-                transitions_summary = f"Transitions P->D: {productive_to_distraction}, D->P: {distraction_to_productive}"
-                print(transitions_summary)
-                metrics_summary += f"\n{transitions_summary}"
+                log = data.get("raw_log", [])
+                if log and len(log) > 1 :
+                    times = [entry['timestamp'] for entry in log]
+                    statuses_raw = [entry['aoi_status'] for entry in log]
+                    status_map = {"Productive": 2, "Distraction": 1, "Outside": 0}
+                    status_plot_colors = {"Productive": pie_colors[0], "Distraction": pie_colors[1], "Outside": pie_colors[2]}
+                    
+                    y_coords = []
+                    color_segments = []
+                    
+                    for i in range(len(times)):
+                        y_coords.append(status_map.get(statuses_raw[i],0))
+                        if i > 0:
+                            color_segments.append(status_plot_colors.get(statuses_raw[i-1], pie_colors[2]))
 
-                productive_bouts_durations = []
-                current_bout_start_timestamp = None
-                
-                for i, entry in enumerate(self.session_data_log):
-                        entry_is_productive = (entry['aoi_status'] == "Productive")
-                        entry_timestamp = entry['timestamp'] 
+                    if len(times) > 1:
+                        for i in range(len(times) - 1):
+                            ax_timeline.plot([times[i], times[i+1]], [y_coords[i], y_coords[i]], color=color_segments[i], linewidth=5)
+                            if y_coords[i] != y_coords[i+1]:
+                                ax_timeline.plot([times[i+1], times[i+1]], [y_coords[i], y_coords[i+1]], color=color_segments[i], linewidth=5)
+                        if len(times) == len(y_coords) and len(times) > 0:
+                             ax_timeline.plot([times[-1], times[-1]+0.5], [y_coords[-1], y_coords[-1]], color=status_plot_colors.get(statuses_raw[-1], pie_colors[2]), linewidth=5)
 
-                        if entry_is_productive and current_bout_start_timestamp is None:
-                                current_bout_start_timestamp = entry_timestamp
-                        elif not entry_is_productive and current_bout_start_timestamp is not None:
-                                bout_duration = entry_timestamp - current_bout_start_timestamp
-                                # Ensure bout duration is not negative
-                                if bout_duration > 0 : productive_bouts_durations.append(bout_duration)
-                                current_bout_start_timestamp = None 
-                
-                if current_bout_start_timestamp is not None and self.session_data_log:
-                        # Ensure last entry's timestamp is used relative to current_bout_start_timestamp
-                        last_entry_timestamp = self.session_data_log[-1]['timestamp']
-                        bout_duration = last_entry_timestamp - current_bout_start_timestamp
-                        if bout_duration > 0 : productive_bouts_durations.append(bout_duration)
 
-                bouts_summary = ""
-                if productive_bouts_durations:
-                        avg_bout_duration = sum(productive_bouts_durations) / len(productive_bouts_durations)
-                        max_bout_duration = max(productive_bouts_durations)
-                        bouts_summary = f"Productive Focus Bouts: Count={len(productive_bouts_durations)}, Avg={avg_bout_duration:.2f}s, Max={max_bout_duration:.2f}s"
+                    ax_timeline.set_yticks([0,1,2]); ax_timeline.set_yticklabels(['Outside', 'Distraction', 'Productive'])
+                    ax_timeline.set_xlabel("Time (s)"); ax_timeline.set_ylabel("AOI Status")
+                    ax_timeline.grid(True, axis='y', linestyle=':', linewidth=0.5, color=grid_color)
+                    ax_timeline.spines['top'].set_visible(False)
+                    ax_timeline.spines['right'].set_visible(False)
+                    ax_timeline.spines['bottom'].set_color(text_color)
+                    ax_timeline.spines['left'].set_color(text_color)
+                    ax_timeline.set_ylim(-0.5, 2.5)
                 else:
-                        bouts_summary = "No productive focus bouts recorded."
-                print(bouts_summary)
-                metrics_summary += f"\n{bouts_summary}"
-                
-                # Update status label with the final summary
-                self.status_label.config(text="Session ended. Metrics calculated (see console).")
+                    ax_timeline.text(0.5, 0.5, "Not enough data for timeline", ha='center', va='center', color=text_color)
+                ax_timeline.set_title('Attention Timeline', color=text_color)
+                fig_timeline.tight_layout(pad=0.5)
+                canvas_timeline = FigureCanvasTkAgg(fig_timeline, master=timeline_frame)
+                canvas_timeline.draw(); canvas_timeline.get_tk_widget().pack(fill='both', expand=True)
+            except Exception as e:
+                print(f"Error creating timeline chart: {e}")
+                ttk.Label(timeline_frame, text=f"Err: Timeline ({e})", wraplength=180).pack()
+
+        create_report_section(main_report_frame, report_data_current, " (Current Session)" if report_data_comparison else "")
+        if report_data_comparison:
+            create_report_section(main_report_frame, report_data_comparison, " (Compared Session)")
+
+        buttons_frame = ttk.Frame(outer_frame)
+        buttons_frame.pack(fill='x', side=tk.BOTTOM, pady=10, padx=10)
+        buttons_frame.grid_columnconfigure(0, weight=1)
+        buttons_frame.grid_columnconfigure(1, weight=1)
+        buttons_frame.grid_columnconfigure(2, weight=1)
+
+        action_button_style = "Accent.TButton" if "Accent.TButton" in self.style.theme_names() else "TButton"
+
+        if report_data_current == self.current_report_data and self.current_report_data is not None:
+            ttk.Button(buttons_frame, text="Save This Report", style=action_button_style,
+                       command=lambda d=report_data_current: self.save_report_to_json(d)).grid(row=0, column=0, padx=5, sticky="ew")
+        ttk.Button(buttons_frame, text="Open & Compare Report", style=action_button_style if report_data_comparison else "TButton",
+                   command=lambda current_data=report_data_current: self.load_and_compare_report(current_data)).grid(row=0, column=1, padx=5, sticky="ew")
+        ttk.Button(buttons_frame, text="Close Report", command=self.report_window_instance.destroy).grid(row=0, column=2, padx=5, sticky="ew")
+
+        self.report_window_instance.update_idletasks()
+        report_canvas.config(scrollregion = report_canvas.bbox("all"))
+
+    def format_metrics_for_display(self, data, text_widget):
+        if not data:
+            text_widget.insert(tk.END, "No data available.")
+            return
+
+        text_widget.tag_configure("heading", font=self.report_font_bold, spacing1=5, spacing3=8, underline=True)
+        text_widget.tag_configure("metric_name", font=self.report_font_bold)
+        text_widget.tag_configure("metric_value", font=self.report_font)
+        text_widget.tag_configure("sub_metric", font=self.report_font, lmargin1=20, lmargin2=20)
+        text_widget.tag_configure("sub_value", font=self.report_font, lmargin1=20, lmargin2=20)
+        text_widget.tag_configure("small_italic", font=(self.report_font[0], self.report_font[1]-1, "italic"), foreground="gray", lmargin1=20, lmargin2=20)
+
+        text_widget.insert(tk.END, "Overall Summary\n", "heading")
+        text_widget.insert(tk.END, "Session Duration: ", "metric_name")
+        text_widget.insert(tk.END, f"{data.get('session_duration', 0):.2f}s\n\n", "metric_value")
+
+        text_widget.insert(tk.END, "Dwell Time Analysis\n", "heading")
+        dwell_times = data.get('dwell_times', {})
+        dwell_percentages = data.get('dwell_percentages', {})
+        for k_dwell, v_dwell in dwell_times.items():
+            text_widget.insert(tk.END, f"{k_dwell}: ", ("sub_metric", "metric_name"))
+            text_widget.insert(tk.END, f"{v_dwell:.2f}s ", "sub_value")
+            text_widget.insert(tk.END, f"({dwell_percentages.get(k_dwell,0):.1f}%)\n", "small_italic")
+        text_widget.insert(tk.END, "\n")
+
+        text_widget.insert(tk.END, "Attention Shifts\n", "heading")
+        transitions = data.get('transitions', {})
+        for k_trans, v_trans in transitions.items():
+            text_widget.insert(tk.END, f"{k_trans.replace('_',' ').title()}: ", ("sub_metric", "metric_name"))
+            text_widget.insert(tk.END, f"{v_trans}\n", "sub_value")
+        text_widget.insert(tk.END, "\n")
+
+        text_widget.insert(tk.END, "Focus Bouts (Productive)\n", "heading")
+        bouts = data.get('focus_bouts', {})
+        text_widget.insert(tk.END, "Count: ", ("sub_metric", "metric_name"))
+        text_widget.insert(tk.END, f"{bouts.get('count',0)}\n", "sub_value")
+        text_widget.insert(tk.END, "Average Duration: ", ("sub_metric", "metric_name"))
+        text_widget.insert(tk.END, f"{bouts.get('avg_duration',0):.2f}s\n", "sub_value")
+        text_widget.insert(tk.END, "Max Duration: ", ("sub_metric", "metric_name"))
+        text_widget.insert(tk.END, f"{bouts.get('max_duration',0):.2f}s\n", "sub_value")
+
+        if "re_engagement_latency" in data:
+            latency = data.get('re_engagement_latency', {})
+            text_widget.insert(tk.END, "\nRe-engagement Latency\n", "heading")
+            text_widget.insert(tk.END, "Average Latency: ", ("sub_metric", "metric_name"))
+            text_widget.insert(tk.END, f"{latency.get('avg_latency', 'N/A'):.2f}s\n", "sub_value")
+            text_widget.insert(tk.END, "Count: ", ("sub_metric", "metric_name"))
+            text_widget.insert(tk.END, f"{latency.get('count', 'N/A')}\n", "sub_value")
+        else:
+            text_widget.insert(tk.END, "\nRe-engagement Latency: ", "heading")
+            text_widget.insert(tk.END, "Not calculated.\n", "small_italic")
+
+    def save_report_to_json(self, report_data_to_save):
+        if not report_data_to_save:
+            simpledialog.messagebox.showerror("Error", "No report data to save.", parent=self.report_window_instance)
+            return
+        filepath = filedialog.asksaveasfilename(
+            defaultextension=".json",
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+            title="Save Report As...",
+            initialfile=f"FocusFlow_Report_{time.strftime('%Y%m%d_%H%M%S')}.json",
+            parent=self.report_window_instance
+        )
+        if filepath:
+            try:
+                with open(filepath, 'w') as f:
+                    json.dump(report_data_to_save, f, indent=4)
+                simpledialog.messagebox.showinfo("Success", f"Report saved to:\n{filepath}", parent=self.report_window_instance)
+            except Exception as e:
+                simpledialog.messagebox.showerror("Error Saving File", f"Could not save report: {e}", parent=self.report_window_instance)
+
+    def load_and_show_report(self, report_to_compare_with=None):
+        parent_window = self.report_window_instance if self.report_window_instance and self.report_window_instance.winfo_exists() else self.root_window
+        filepath = filedialog.askopenfilename(
+            defaultextension=".json",
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+            title="Open Report File",
+            parent=parent_window
+        )
+        if filepath:
+            try:
+                with open(filepath, 'r') as f:
+                    loaded_data = json.load(f)
+                if not all(k in loaded_data for k in ["session_duration", "dwell_times", "raw_log"]):
+                    raise ValueError("Report file is missing essential data.")
+
+                report_filename = os.path.basename(filepath)
+                if report_to_compare_with:
+                    self._show_report_window(report_to_compare_with, loaded_data, report_title=f"Comparison: Current vs. {report_filename}")
+                else:
+                    self._show_report_window(loaded_data, report_title=f"Report: {report_filename}")
+
+            except Exception as e:
+                simpledialog.messagebox.showerror("Error Loading File", f"Could not load report: {e}", parent=parent_window)
+
+    def load_and_compare_report(self, current_report_data_for_comparison):
+        self.load_and_show_report(report_to_compare_with=current_report_data_for_comparison)
+
+    def on_closing(self):
+        if self.session_active: self.end_tracking_session_ui(force_end=True)
+        if self.gz_client.is_connected:
+            self.is_tracking_connection = False
+            if self.after_id_gaze_update: self.root_window.after_cancel(self.after_id_gaze_update)
+            if self.after_id_session_timer: self.root_window.after_cancel(self.after_id_session_timer)
+            self.gz_client.disconnect()
+        if self.aoi_definition_window: self.aoi_definition_window.destroy()
+        if self.report_window_instance: self.report_window_instance.destroy()
+        self.root_window.destroy()
 
 if __name__ == "__main__":
-        # Runs when main_app.py is executed
-        root = tk.Tk()
-        app = FocusFlowApp(root)
-        root.protocol("WM_DELETE_WINDOW", app.on_closing)
-        root.mainloop()
+    root = tk.Tk()
+    azure_tcl_path = os.path.join(os.path.dirname(__file__), "themes", "azure.tcl")
+    azure_images_path = os.path.join(os.path.dirname(__file__), "themes", "azure")
+
+    try:
+        root.tk.call("lappend", "auto_path", os.path.join(os.path.dirname(__file__), "themes"))
+        root.tk.call("source", azure_tcl_path)
+        root.tk.call("set_theme", "dark")
+
+    except tk.TclError as e:
+        print(f"Error loading Azure theme: {e}")
+        print("Ensure 'azure.tcl' and the 'azure' image asset folder are in a 'themes' subdirectory.")
+
+    try:
+        root.state('zoomed')
+    except tk.TclError:
+        screen_width = root.winfo_screenwidth()
+        screen_height = root.winfo_screenheight()
+        root.geometry(f"{screen_width}x{screen_height}+0+0")
+
+    app = FocusFlowApp(root)
+    root.mainloop()
