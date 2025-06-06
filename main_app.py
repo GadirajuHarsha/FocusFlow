@@ -47,6 +47,16 @@ class FocusFlowApp:
         self.session_elapsed_time_str = tk.StringVar(value="00:00:00")
 
         self.current_report_data = None
+        
+        # --- State for advanced real-time indicator ---
+        # Thresholds (in seconds)
+        self.CONSISTENT_FOCUS_THRESHOLD = 5.0
+        self.SIGNIFICANT_DISTRACTION_THRESHOLD = 3.0
+        # State tracking variables
+        self.last_aoi_type_for_indicator = "Outside"
+        self.time_in_current_aoi = 0.0
+        self.last_aoi_change_time = time.time()
+        self.indicator_transition_times = []
 
         self.root_window.protocol("WM_DELETE_WINDOW", self.on_closing)
         self.root_window.grid_rowconfigure(0, weight=1)
@@ -233,17 +243,69 @@ class FocusFlowApp:
             if hasattr(self, 'canvas_aoi_preview'): self.canvas_aoi_preview.coords(self.gaze_dot_preview,0,0,0,0)
 
 
+    def _update_realtime_indicator_logic(self, current_aoi_status):
+        """Contains the time-based rules for the session overlay focus indicator."""
+        if not self.session_active:
+            return "gray" # Default color when not in a session
+
+        now = time.time()
+        
+        # --- Update state based on current gaze ---
+        if current_aoi_status != self.last_aoi_type_for_indicator:
+            self.last_aoi_change_time = now
+            self.time_in_current_aoi = 0.0
+            self.last_aoi_type_for_indicator = current_aoi_status
+            
+            # Log transition time for frequency analysis
+            self.indicator_transition_times.append(now)
+        else:
+            self.time_in_current_aoi = now - self.last_aoi_change_time
+
+        # --- Determine color based on rules ---
+        indicator_color = "gray" # Default
+
+        # Rule 1: Deep focus (green)
+        if current_aoi_status == "Productive" and self.time_in_current_aoi > self.CONSISTENT_FOCUS_THRESHOLD:
+            indicator_color = "green"
+        elif current_aoi_status == "Productive":
+            indicator_color = "#90EE90" # Light green for emerging focus
+
+        # Rule 2: Significant distraction (red)
+        elif current_aoi_status == "Distraction" and self.time_in_current_aoi > self.SIGNIFICANT_DISTRACTION_THRESHOLD:
+            indicator_color = "red"
+        elif current_aoi_status == "Distraction":
+            indicator_color = "orange" # Warning color for glancing at distraction
+
+        # Rule 3: Frequent transitions (yellow)
+        # Prune old transition times (e.g., keep last 10 seconds)
+        transition_window = 10.0
+        self.indicator_transition_times = [t for t in self.indicator_transition_times if now - t < transition_window]
+        
+        # If there have been 4 or more transitions in the last 10 seconds, indicate fragmentation
+        if len(self.indicator_transition_times) >= 4:
+            indicator_color = "yellow"
+
+        # Rule 4: Lingering outside (can also be yellow or gray)
+        elif current_aoi_status == "Outside" and self.time_in_current_aoi > 5.0: # If outside for >5s
+            indicator_color = "#A9A9A9" # Dark Gray
+        elif current_aoi_status == "Outside":
+            indicator_color = "#D3D3D3" # Light Gray
+
+        return indicator_color
+
+
     def update_gaze_preview_loop(self):
         if not self.is_tracking_connection or not self.gz_client.is_connected:
             self._update_focus_indicator_colors("gray")
             return
 
         gaze_data = self.gz_client.receive_gaze_data()
-        current_aoi_hit_type_for_session = "Outside"
+        current_aoi_hit_type = "Outside"
 
         if gaze_data and 'GazeX' in gaze_data and 'GazeY' in gaze_data:
             raw_x, raw_y = gaze_data['GazeX'], gaze_data['GazeY']
-            
+
+            # Update preview canvas gaze dot
             if hasattr(self, 'canvas_aoi_preview') and self.canvas_aoi_preview.winfo_exists():
                 canvas_w, canvas_h = self.canvas_aoi_preview.winfo_width(), self.canvas_aoi_preview.winfo_height()
                 if canvas_w > 1 and canvas_h > 1 :
@@ -251,8 +313,9 @@ class FocusFlowApp:
                     preview_y = (raw_y / self.actual_screen_height) * canvas_h
                     dot_size = 10
                     self.canvas_aoi_preview.coords(self.gaze_dot_preview, preview_x - dot_size/2, preview_y - dot_size/2, preview_x + dot_size/2, preview_y + dot_size/2)
-
-                    current_aoi_hit_type_for_preview = "Outside"
+                    
+                    # Determine AOI for preview dot color only
+                    preview_hit_type = "Outside"
                     if self.aoi_list:
                         scaled_hits = []
                         for aoi in self.aoi_list:
@@ -261,39 +324,43 @@ class FocusFlowApp:
                             r_x2_c = (aoi['rect_screen_coords'][2] / self.actual_screen_width) * canvas_w
                             r_y2_c = (aoi['rect_screen_coords'][3] / self.actual_screen_height) * canvas_h
                             if r_x1_c <= preview_x <= r_x2_c and r_y1_c <= preview_y <= r_y2_c:
-                                area = (r_x2_c - r_x1_c) * (r_y2_c - r_y1_c)
-                                scaled_hits.append({'type': aoi['type'], 'area': area})
+                                scaled_hits.append({'type': aoi['type'], 'area': (r_x2_c - r_x1_c) * (r_y2_c - r_y1_c)})
                         if scaled_hits:
                             scaled_hits.sort(key=lambda item: item['area'])
-                            current_aoi_hit_type_for_preview = scaled_hits[0]['type']
-                    self._update_gaze_dot_preview_color(current_aoi_hit_type_for_preview)
+                            preview_hit_type = scaled_hits[0]['type']
+                    self._update_gaze_dot_preview_color(preview_hit_type)
                     if not self.session_active and self.defining_aoi_type_transparent is None:
-                         self.status_label.config(text=f"Gaze (Preview): X={preview_x:.0f}, Y={preview_y:.0f} | AOI: {current_aoi_hit_type_for_preview}")
+                         self.status_label.config(text=f"Gaze (Preview): X={preview_x:.0f}, Y={preview_y:.0f} | AOI: {preview_hit_type}")
 
-
+            # Session Active Logic
             if self.session_active:
                 session_hits = []
                 for aoi in self.aoi_list:
                     sx1, sy1, sx2, sy2 = aoi['rect_screen_coords']
                     if sx1 <= raw_x <= sx2 and sy1 <= raw_y <= sy2:
-                        area = (sx2-sx1) * (sy2-sy1)
-                        session_hits.append({'type': aoi['type'], 'area': area})
+                        session_hits.append({'type': aoi['type'], 'area': (sx2-sx1)*(sy2-sy1)})
                 if session_hits:
                     session_hits.sort(key=lambda item: item['area'])
-                    current_aoi_hit_type_for_session = session_hits[0]['type']
-                self._update_focus_indicator_colors(current_aoi_hit_type_for_session)
+                    current_aoi_hit_type = session_hits[0]['type']
+
+                # Update advanced real-time indicator
+                indicator_color = self._update_realtime_indicator_logic(current_aoi_hit_type)
+                self._update_focus_indicator_colors(indicator_color)
+                
+                # Log data
                 self.session_data_log.append({
                     'timestamp': time.time() - self.session_start_time,
-                    'raw_x': raw_x, 'raw_y': raw_y, 'aoi_status': current_aoi_hit_type_for_session
+                    'raw_x': raw_x, 'raw_y': raw_y, 'aoi_status': current_aoi_hit_type
                 })
 
-        elif not self.gz_client.is_connected:
+        elif not self.gz_client.is_connected: # Connection lost
             self.status_label.config(text="Connection lost. Please check GazePointer.")
             self.connect_button.config(text="Connect to GazePointer"); self.is_tracking_connection = False
             self._update_focus_indicator_colors("gray"); self.gz_client.disconnect()
             return
-        self.after_id_gaze_update = self.root_window.after(30, self.update_gaze_preview_loop)
 
+        self.after_id_gaze_update = self.root_window.after(30, self.update_gaze_preview_loop)
+        
     def _update_gaze_dot_preview_color(self, aoi_type):
         if not hasattr(self, 'canvas_aoi_preview') or not self.canvas_aoi_preview.winfo_exists(): return
         color_map = {"Productive": "green", "Distraction": "orange", "Outside": "red", "gray":"#7f8c8d"}
@@ -302,14 +369,18 @@ class FocusFlowApp:
         self.canvas_aoi_preview.itemconfig(self.gaze_dot_preview, fill=fill_color, outline=outline_color)
 
 
-    def _update_focus_indicator_colors(self, aoi_type_for_session):
-        if not self.session_active or not self.session_overlay_window: return
+    def _update_focus_indicator_colors(self, indicator_color_string):
+        """Directly applies the given color string to the session overlay indicator."""
+        if not self.session_active or not self.session_overlay_window:
+            return
         try:
-            color_map = {"Productive": "green", "Distraction": "orange", "Outside": "red", "gray":"gray"}
-            indicator_color = color_map.get(aoi_type_for_session, "gray")
+            # Directly use the provided color string. No more mapping.
             if self.overlay_focus_indicator_canvas and self.overlay_focus_indicator_canvas.winfo_exists():
-                 self.overlay_focus_indicator_canvas.config(bg=indicator_color)
-        except tk.TclError: pass
+                 self.overlay_focus_indicator_canvas.config(bg=indicator_color_string)
+        except tk.TclError:
+            # This can happen if the color string is invalid for some reason,
+            # or the widget is destroyed between checks.
+            pass
 
 
     def initiate_transparent_aoi_definition(self, aoi_type):
@@ -443,61 +514,7 @@ class FocusFlowApp:
             self.status_label.config(text="Session ended. No data logged.")
             self.current_report_data = None
 
-    def generate_session_metrics_data(self):
-        if not self.session_data_log: return None
-        report_data = {"raw_log": self.session_data_log, "report_generated_timestamp": time.time()}
-        durations = []
-        if len(self.session_data_log) > 1:
-            for i in range(len(self.session_data_log) - 1):
-                durations.append(self.session_data_log[i+1]['timestamp'] - self.session_data_log[i]['timestamp'])
-            if durations: durations.append(durations[-1])
-            else: durations.append(0.03)
-        elif self.session_data_log: durations.append(0.03)
-
-        time_prod,time_dist,time_out = 0,0,0
-        total_time = sum(durations) if durations else 0
-        report_data["session_duration"] = total_time
-
-        for i, entry in enumerate(self.session_data_log):
-            dt = durations[i]
-            if entry['aoi_status'] == "Productive": time_prod += dt
-            elif entry['aoi_status'] == "Distraction": time_dist += dt
-            else: time_out += dt
-        
-        report_data["dwell_times"] = {"Productive": time_prod, "Distraction": time_dist, "Outside": time_out}
-        report_data["dwell_percentages"] = {
-            "Productive": (time_prod/total_time)*100 if total_time > 0 else 0,
-            "Distraction": (time_dist/total_time)*100 if total_time > 0 else 0,
-            "Outside": (time_out/total_time)*100 if total_time > 0 else 0
-        }
-        p_to_d, d_to_p = 0,0
-        if len(self.session_data_log) > 1:
-            for i in range(1, len(self.session_data_log)):
-                prev, curr = self.session_data_log[i-1]['aoi_status'], self.session_data_log[i]['aoi_status']
-                if prev=="Productive" and curr=="Distraction": p_to_d+=1
-                elif prev=="Distraction" and curr=="Productive": d_to_p+=1
-        report_data["transitions"] = {"P_to_D":p_to_d, "D_to_P":d_to_p}
-
-        bout_durs = []
-        cb_start = None
-        for e in self.session_data_log:
-            is_p = e['aoi_status'] == "Productive"; ts = e['timestamp']
-            if is_p and cb_start is None: cb_start=ts
-            elif not is_p and cb_start is not None:
-                dur = ts - cb_start
-                if dur > 0: bout_durs.append(dur)
-                cb_start = None
-        if cb_start is not None and self.session_data_log:
-            dur = self.session_data_log[-1]['timestamp']-cb_start
-            if dur > 0: bout_durs.append(dur)
-        
-        report_data["focus_bouts"] = {
-            "count": len(bout_durs),
-            "avg_duration": sum(bout_durs)/len(bout_durs) if bout_durs else 0,
-            "max_duration": max(bout_durs) if bout_durs else 0,
-            "durations_list": bout_durs
-        }
-        return report_data
+    
 
     def _show_report_window(self, report_data_current, report_data_comparison=None, report_title="Session Report"):
         if self.report_window_instance and self.report_window_instance.winfo_exists():
@@ -728,6 +745,98 @@ class FocusFlowApp:
         self.report_window_instance.update_idletasks()
         report_canvas.config(scrollregion = report_canvas.bbox("all"))
 
+    def generate_session_metrics_data(self):
+        if not self.session_data_log or len(self.session_data_log) < 2: return None
+        
+        # --- Basic Dwell Time and Transition Calculation (as before) ---
+        report_data = {"raw_log": self.session_data_log, "report_generated_timestamp": time.time()}
+        durations = [(self.session_data_log[i+1]['timestamp'] - self.session_data_log[i]['timestamp']) for i in range(len(self.session_data_log) - 1)]
+        durations.append(durations[-1] if durations else 0.03) # Estimate last entry's duration
+
+        time_prod, time_dist, time_out = 0, 0, 0
+        total_time = sum(durations)
+        report_data["session_duration"] = total_time
+
+        for i, entry in enumerate(self.session_data_log):
+            dt = durations[i]
+            if entry['aoi_status'] == "Productive": time_prod += dt
+            elif entry['aoi_status'] == "Distraction": time_dist += dt
+            else: time_out += dt
+        
+        report_data["dwell_times"] = {"Productive": time_prod, "Distraction": time_dist, "Outside": time_out}
+        report_data["dwell_percentages"] = {
+            "Productive": (time_prod/total_time)*100 if total_time > 0 else 0,
+            "Distraction": (time_dist/total_time)*100 if total_time > 0 else 0,
+            "Outside": (time_out/total_time)*100 if total_time > 0 else 0
+        }
+        p_to_d, d_to_p = 0, 0
+        for i in range(1, len(self.session_data_log)):
+            prev, curr = self.session_data_log[i-1]['aoi_status'], self.session_data_log[i]['aoi_status']
+            if prev == "Productive" and curr == "Distraction": p_to_d += 1
+            elif prev == "Distraction" and curr == "Productive": d_to_p += 1
+        report_data["transitions"] = {"P_to_D": p_to_d, "D_to_P": d_to_p}
+
+        # --- Refined Focus Bout and Re-engagement Latency Calculation ---
+        SIGNIFICANT_DISTRACTION_S = 3.0 # Threshold from your plan (3-5s)
+
+        bout_durs = []
+        latency_times = []
+        
+        in_productive_bout = False
+        bout_start_time = 0
+        
+        in_distraction_bout = False
+        distraction_start_time = 0
+        last_significant_distraction_end_time = 0
+
+        for i in range(len(self.session_data_log)):
+            entry = self.session_data_log[i]
+            is_prod = entry['aoi_status'] == "Productive"
+            is_dist = entry['aoi_status'] == "Distraction"
+            timestamp = entry['timestamp']
+            
+            # --- Productive Bout Logic ---
+            if is_prod and not in_productive_bout:
+                in_productive_bout = True
+                bout_start_time = timestamp
+                # Check if this is a re-engagement
+                if last_significant_distraction_end_time > 0:
+                    latency = bout_start_time - last_significant_distraction_end_time
+                    latency_times.append(latency)
+                    last_significant_distraction_end_time = 0 # Reset after measuring
+
+            # --- Distraction Logic (for terminating bouts and starting latency measurement) ---
+            if is_dist and not in_distraction_bout:
+                in_distraction_bout = True
+                distraction_start_time = timestamp
+
+            if not is_dist and in_distraction_bout: # Distraction bout just ended
+                in_distraction_bout = False
+                distraction_duration = timestamp - distraction_start_time
+                if distraction_duration >= SIGNIFICANT_DISTRACTION_S:
+                    # This was a significant distraction. End any ongoing productive bout.
+                    if in_productive_bout:
+                        bout_durs.append(distraction_start_time - bout_start_time)
+                        in_productive_bout = False
+                    # Mark the end time, to measure latency for the *next* productive bout
+                    last_significant_distraction_end_time = timestamp
+
+        # Catch any productive bout that was ongoing at the end of the session
+        if in_productive_bout:
+            bout_durs.append(self.session_data_log[-1]['timestamp'] - bout_start_time)
+
+        report_data["focus_bouts"] = {
+            "count": len(bout_durs),
+            "avg_duration": sum(bout_durs)/len(bout_durs) if bout_durs else 0,
+            "max_duration": max(bout_durs) if bout_durs else 0,
+            "durations_list": [d for d in bout_durs if d > 0.1] # Filter out tiny artifacts
+        }
+        report_data["re_engagement_latency"] = {
+            "count": len(latency_times),
+            "avg_latency": sum(latency_times)/len(latency_times) if latency_times else 0
+        }
+        return report_data
+
     def format_metrics_for_display(self, data, text_widget):
         if not data:
             text_widget.insert(tk.END, "No data available.")
@@ -768,17 +877,15 @@ class FocusFlowApp:
         text_widget.insert(tk.END, f"{bouts.get('avg_duration',0):.2f}s\n", "sub_value")
         text_widget.insert(tk.END, "Max Duration: ", ("sub_metric", "metric_name"))
         text_widget.insert(tk.END, f"{bouts.get('max_duration',0):.2f}s\n", "sub_value")
-
-        if "re_engagement_latency" in data:
-            latency = data.get('re_engagement_latency', {})
-            text_widget.insert(tk.END, "\nRe-engagement Latency\n", "heading")
-            text_widget.insert(tk.END, "Average Latency: ", ("sub_metric", "metric_name"))
-            text_widget.insert(tk.END, f"{latency.get('avg_latency', 'N/A'):.2f}s\n", "sub_value")
-            text_widget.insert(tk.END, "Count: ", ("sub_metric", "metric_name"))
-            text_widget.insert(tk.END, f"{latency.get('count', 'N/A')}\n", "sub_value")
-        else:
-            text_widget.insert(tk.END, "\nRe-engagement Latency: ", "heading")
-            text_widget.insert(tk.END, "Not calculated.\n", "small_italic")
+        text_widget.insert(tk.END, "(A bout ends after a significant distraction > 3s)\n", "small_italic")
+        
+        text_widget.insert(tk.END, "\nRe-engagement Latency\n", "heading")
+        latency = data.get('re_engagement_latency', {})
+        text_widget.insert(tk.END, "Count of Re-engagements: ", ("sub_metric", "metric_name"))
+        text_widget.insert(tk.END, f"{latency.get('count', 0)}\n", "sub_value")
+        text_widget.insert(tk.END, "Average Latency: ", ("sub_metric", "metric_name"))
+        text_widget.insert(tk.END, f"{latency.get('avg_latency', 0):.2f}s\n", "sub_value")
+        text_widget.insert(tk.END, "(Time to return to focus after a significant distraction)\n", "small_italic")
 
     def save_report_to_json(self, report_data_to_save):
         if not report_data_to_save:
