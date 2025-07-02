@@ -1,4 +1,7 @@
 # FocusFlow: Visualizing and Understanding Attentional Patterns
+
+### Demo Video: https://www.youtube.com/watch?v=nH8nZ9u9BH8
+
 ## 1. Introduction & Objective
 FocusFlow is a desktop application designed to provide users with deep insights into their visual attention and focus habits during on-screen work. In an era of constant digital distractions, understanding where our attention goes is the first step toward improving concentration and productivity.
 
